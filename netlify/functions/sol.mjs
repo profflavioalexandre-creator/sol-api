@@ -84,18 +84,64 @@ Use somente os dados recebidos; se algo não estiver nos dados, diga que não te
 const corta = (s, n) => String(s || '').slice(0, n);
 
 // O app chama esta função de outro endereço: libera só o site do app (variável SITE_DO_APP), ou qualquer um se ela não existir.
+let ORIGEM = '*';
 const CORS = () => ({
-  'Access-Control-Allow-Origin': process.env.SITE_DO_APP || '*',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type'
+  'Access-Control-Allow-Origin': ORIGEM,
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+  'Vary': 'Origin'
 });
-const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json', ...CORS() } });
+const json = (obj, st = 200) => new Response(JSON.stringify(obj), { status: typeof st === 'number' ? st : (st && st.status) || 200, headers: { 'Content-Type': 'application/json', ...CORS() } });
+function origemPermitida(origin) {
+  const site = (process.env.SITE_DO_APP || '').trim().replace(/\/+$/, '');
+  if (!site || !origin) return origin || '*';
+  const host = site.replace(/^https?:\/\//, '');
+  const ok = origin === site || origin === 'https://' + host || origin.endsWith('--' + host) || origin.endsWith('.' + host);
+  return ok ? origin : site;
+}
+// Chama o Google tentando os modelos da lista e, se a chave não for aceita no cabeçalho, também pela URL
+async function google(modelos, corpo, chave, log) {
+  for (const m of modelos) {
+    for (const modo of ['cabecalho', 'url']) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent` + (modo === 'url' ? `?key=${encodeURIComponent(chave)}` : '');
+      const headers = { 'Content-Type': 'application/json' };
+      if (modo === 'cabecalho') headers['x-goog-api-key'] = chave;
+      try {
+        const r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(corpo) });
+        if (r.ok) return { ok: true, j: await r.json(), modelo: m };
+        const erro = (await r.text()).slice(0, 300);
+        log && log.push({ modelo: m, modo, status: r.status, erro });
+        console.log('Sol: Google respondeu', r.status, m, modo, erro);
+        if (r.status === 429) return { ok: false, status: 429 };
+        if (r.status !== 401 && r.status !== 403) break;
+      } catch (e) { log && log.push({ modelo: m, modo, erro: String(e).slice(0, 200) }); console.log('Sol: falha de rede', m, String(e)); break; }
+    }
+  }
+  return { ok: false };
+}
+const MODELOS_TEXTO = () => (process.env.GEMINI_MODEL || 'gemini-flash-latest,gemini-3.8-flash,gemini-3.8-flash-lite,gemini-flash-lite-latest,gemini-2.5-flash').split(',').map(m => m.trim()).filter(Boolean);
 
 export default async (req) => {
+  ORIGEM = origemPermitida(req.headers.get('origin'));
   if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS() });
+  const chave = (process.env.GEMINI_API_KEY || '').trim();
+  // Teste: abra /.netlify/functions/sol?teste=1 no navegador para ver se a ligação com o Google funciona
+  if (req.method === 'GET') {
+    if (!new URL(req.url).searchParams.has('teste')) return new Response('Use POST', { status: 405, headers: CORS() });
+    if (!chave) return json({ resultado: 'FALTA A CHAVE: crie a variável GEMINI_API_KEY no Netlify e publique de novo.' });
+    const log = [];
+    const r = await google(MODELOS_TEXTO(), { contents: [{ parts: [{ text: 'Responda só: Sol ligado.' }] }] }, chave, log);
+    return json({
+      resultado: r.ok ? 'TUDO CERTO: o Sol está ligado ao Google.' : 'O Google recusou. Veja os detalhes abaixo.',
+      chave: `presente, começa com ${chave.slice(0, 3)}..., ${chave.length} caracteres`,
+      site_do_app: process.env.SITE_DO_APP || '(não definido)',
+      modelo_que_funcionou: r.modelo || null,
+      resposta: r.ok ? (r.j.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('') : null,
+      tentativas: log
+    });
+  }
   if (req.method !== 'POST') return new Response('Use POST', { status: 405, headers: CORS() });
-  const chave = process.env.GEMINI_API_KEY;
-  if (!chave) return json({ texto: '' }, { status: 503 });
+  if (!chave) return json({ texto: '' }, 503);
   let b;
   try { b = await req.json(); } catch { return new Response('JSON inválido', { status: 400, headers: CORS() }); }
 
@@ -105,22 +151,14 @@ export default async (req) => {
     const voz = VOZES.includes(b.voz) ? b.voz : 'Charon';
     const modelos = (process.env.GEMINI_TTS_MODEL || 'gemini-3.8-flash-lite-tts,gemini-3.8-flash-tts,gemini-3.1-flash-tts-preview').split(',').map(m => m.trim()).filter(Boolean);
     const texto = `Diga em português do Brasil, com voz calma, educada e acolhedora de professor, em ritmo natural: ${corta(b.tts, 1800)}`;
-    for (const m of modelos) {
-      try {
-        const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': chave },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: texto }] }],
-            generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voz } } } }
-          })
-        });
-        if (!r.ok) continue;
-        const j = await r.json();
-        const parte = (j.candidates?.[0]?.content?.parts || []).find(p => p.inlineData || p.inline_data);
-        const d = parte && (parte.inlineData || parte.inline_data);
-        if (d && d.data) return json({ audio: d.data, mime: d.mimeType || d.mime_type || 'audio/L16;rate=24000' });
-      } catch {}
+    const r = await google(modelos, {
+      contents: [{ parts: [{ text: texto }] }],
+      generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voz } } } }
+    }, chave);
+    if (r.ok) {
+      const parte = (r.j.candidates?.[0]?.content?.parts || []).find(p => p.inlineData || p.inline_data);
+      const d = parte && (parte.inlineData || parte.inline_data);
+      if (d && d.data) return json({ audio: d.data, mime: d.mimeType || d.mime_type || 'audio/L16;rate=24000' });
     }
     return json({ audio: '' }, 502);
   }
@@ -147,23 +185,13 @@ export default async (req) => {
   }
   contents.push({ role: 'user', parts: partes });
 
-  const modelo = process.env.GEMINI_MODEL || 'gemini-flash-latest';
-  try {
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': chave },
-      body: JSON.stringify({
-        system_instruction: { parts: [{ text: mentor ? SISTEMA_MENTOR : SISTEMA }] },
-        contents,
-        generationConfig: { temperature: 0.6, maxOutputTokens: 900 }
-      })
-    });
-    if (r.status === 429) return json({ texto: 'Muita gente me chamando agora! Me pergunta de novo daqui a um minutinho.' });
-    if (!r.ok) return json({ texto: '' }, { status: 502 });
-    const j = await r.json();
-    const texto = (j.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('').trim();
-    return json({ texto });
-  } catch {
-    return json({ texto: '' }, { status: 502 });
-  }
+  const r = await google(MODELOS_TEXTO(), {
+    system_instruction: { parts: [{ text: mentor ? SISTEMA_MENTOR : SISTEMA }] },
+    contents,
+    generationConfig: { temperature: 0.6, maxOutputTokens: 900 }
+  }, chave);
+  if (r.status === 429) return json({ texto: 'Muita gente me chamando agora! Me pergunta de novo daqui a um minutinho.' });
+  if (!r.ok) return json({ texto: '' }, 502);
+  const texto = (r.j.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('').trim();
+  return json({ texto });
 };
