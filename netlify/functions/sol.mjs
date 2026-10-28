@@ -99,6 +99,32 @@ export default async (req) => {
   let b;
   try { b = await req.json(); } catch { return new Response('JSON inválido', { status: 400, headers: CORS() }); }
 
+  // VOZ DO SOL: transforma o texto em fala com as vozes do Google (masculinas e femininas)
+  if (typeof b.tts === 'string') {
+    const VOZES = ['Charon','Iapetus','Sadaltager','Achird','Orus','Sulafat','Vindemiatrix','Achernar','Kore','Aoede'];
+    const voz = VOZES.includes(b.voz) ? b.voz : 'Charon';
+    const modelos = (process.env.GEMINI_TTS_MODEL || 'gemini-3.8-flash-lite-tts,gemini-3.8-flash-tts,gemini-3.1-flash-tts-preview').split(',').map(m => m.trim()).filter(Boolean);
+    const texto = `Diga em português do Brasil, com voz calma, educada e acolhedora de professor, em ritmo natural: ${corta(b.tts, 1800)}`;
+    for (const m of modelos) {
+      try {
+        const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': chave },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: texto }] }],
+            generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voz } } } }
+          })
+        });
+        if (!r.ok) continue;
+        const j = await r.json();
+        const parte = (j.candidates?.[0]?.content?.parts || []).find(p => p.inlineData || p.inline_data);
+        const d = parte && (parte.inlineData || parte.inline_data);
+        if (d && d.data) return json({ audio: d.data, mime: d.mimeType || d.mime_type || 'audio/L16;rate=24000' });
+      } catch {}
+    }
+    return json({ audio: '' }, 502);
+  }
+
   const aluno = b.aluno || {};
   const memoria = b.memoria || {};
   const historico = Array.isArray(b.historico) ? b.historico.slice(-8) : [];
