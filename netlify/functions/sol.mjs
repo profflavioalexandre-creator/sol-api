@@ -140,7 +140,8 @@ function origemPermitida(origin) {
   return ok ? origin : site;
 }
 // Chama o Google tentando os modelos da lista e, se a chave não for aceita no cabeçalho, também pela URL
-async function google(modelos, corpo, chave, log, ate = Date.now() + 8500) {
+// porTentativa: tempo máximo de cada modelo; se um modelo do Google travar, passa logo para o próximo da lista
+async function google(modelos, corpo, chave, log, ate = Date.now() + 8500, porTentativa = 0) {
   for (const m of modelos) {
     for (const modo of ['cabecalho', 'url']) {
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent` + (modo === 'url' ? `?key=${encodeURIComponent(chave)}` : '');
@@ -148,7 +149,8 @@ async function google(modelos, corpo, chave, log, ate = Date.now() + 8500) {
       if (modo === 'cabecalho') headers['x-goog-api-key'] = chave;
       const resta = ate - Date.now();
       if (resta < 800) return { ok: false, status: 408 };
-      const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), resta);
+      const lim = porTentativa ? Math.min(resta, porTentativa) : resta;
+      const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), lim);
       try {
         const r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(corpo), signal: ctl.signal });
         clearTimeout(tm);
@@ -163,7 +165,7 @@ async function google(modelos, corpo, chave, log, ate = Date.now() + 8500) {
         console.log('Sol: Google respondeu', r.status, m, modo, erro);
         if (r.status === 429) return { ok: false, status: 429 };
         if (r.status !== 401 && r.status !== 403) break;
-      } catch (e) { clearTimeout(tm); log && log.push({ modelo: m, modo, erro: String(e).slice(0, 200) }); console.log('Sol: falha de rede', m, String(e)); break; }
+      } catch (e) { clearTimeout(tm); log && log.push({ modelo: m, modo, erro: (ctl.signal.aborted ? `sem resposta em ${Math.round(lim/1000)} s (Google lento ou sobrecarregado)` : String(e)).slice(0, 200) }); console.log('Sol: falha de rede', m, String(e)); break; }
     }
   }
   return { ok: false };
@@ -188,7 +190,7 @@ export default async (req) => {
     if (!new URL(req.url).searchParams.has('teste')) return new Response('Use POST', { status: 405, headers: CORS() });
     if (!chave) return json({ resultado: 'FALTA A CHAVE: crie a variável GEMINI_API_KEY no Netlify e publique de novo.' });
     const log = [];
-    const r = await google(MODELOS_TEXTO(), { contents: [{ parts: [{ text: 'Responda só: Sol ligado.' }] }] }, chave, log);
+    const r = await google(MODELOS_TEXTO(), { contents: [{ parts: [{ text: 'Responda só: Sol ligado.' }] }], generationConfig: { thinkingConfig: { thinkingBudget: 0 } } }, chave, log, Date.now() + 9500, 3200);
     return json({
       resultado: r.ok ? 'TUDO CERTO: o Sol está ligado ao Google.' : 'O Google recusou. Veja os detalhes abaixo.',
       chave: `presente, começa com ${chave.slice(0, 3)}..., ${chave.length} caracteres`,
@@ -236,7 +238,7 @@ export default async (req) => {
     system_instruction: { parts: [{ text: mentor ? SISTEMA_MENTOR : SISTEMA }] },
     contents,
     generationConfig: { temperature: 0.6, maxOutputTokens: 600, thinkingConfig: { thinkingBudget: 0 } }
-  }, chave, null, inicio + 7000);
+  }, chave, null, inicio + 7000, 3400);
   if (r.status === 429) return json({ texto: 'Muita gente me chamando agora! Me pergunta de novo daqui a um minutinho.' });
   if (!r.ok) return json({ texto: '' }, 502);
   const texto = (r.j.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('').trim();
